@@ -38,6 +38,22 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
 LLM_MAX_ATTEMPTS = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "3")))
 
+# Optional shared secret used to authenticate internal callers to the
+# state-changing prediction/LLM endpoints. When empty, auth is disabled so the
+# service can still run in a trusted internal network (e.g. only reachable on a
+# Docker-internal network). Recommended to set when the port is reachable
+# outside the stack.
+AI_SERVICE_AUTH_TOKEN = os.getenv("AI_SERVICE_AUTH_TOKEN", "").strip()
+
+
+def require_auth(request: Request) -> None:
+    """Reject state-changing requests unless a valid bearer token is supplied."""
+    if not AI_SERVICE_AUTH_TOKEN:
+        return
+    header = request.headers.get("Authorization", "")
+    if header != f"Bearer {AI_SERVICE_AUTH_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid service token")
+
 app = FastAPI(title="ATOM AI Service", version=ATOM_MODEL_VERSION)
 
 
@@ -163,7 +179,8 @@ SOLVENT_FACTORS = {
 
 
 @app.post("/predict/atom")
-def predict_atom(req: AtomPredictRequest):
+def predict_atom(req: AtomPredictRequest, request: Request):
+    require_auth(request)
     started = time.perf_counter()
     if req.inputConditions is None:
         raise HTTPException(status_code=422, detail="inputConditions is required")
@@ -435,7 +452,8 @@ RULE_LEXICON: list[tuple[str, str, int]] = [
 
 
 @app.post("/llm/complete")
-def llm_complete(req: LlmCompleteRequest):
+def llm_complete(req: LlmCompleteRequest, request: Request):
+    require_auth(request)
     started = time.perf_counter()
     requested_model = (req.modelName or "").strip()
     if llm_configured() and requested_model.lower() not in ("rule-based-screening",):

@@ -12,14 +12,17 @@ import org.springframework.web.client.RestClient;
 public class AiServiceClient {
     private final RestClient restClient;
     private final boolean enabled;
+    private final String authToken;
 
     public AiServiceClient(
         @Value("${app.ai.base-url:http://localhost:8000}") String baseUrl,
         @Value("${app.ai.enabled:true}") boolean enabled,
         @Value("${app.ai.connect-timeout-ms:5000}") int connectTimeoutMs,
-        @Value("${app.ai.read-timeout-ms:30000}") int readTimeoutMs
+        @Value("${app.ai.read-timeout-ms:30000}") int readTimeoutMs,
+        @Value("${app.ai.auth-token:}") String authToken
     ) {
         this.enabled = enabled;
+        this.authToken = authToken == null ? "" : authToken;
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(connectTimeoutMs);
         factory.setReadTimeout(readTimeoutMs);
@@ -41,8 +44,15 @@ public class AiServiceClient {
         return post("/llm/complete", payload);
     }
 
+    private RestClient.RequestHeadersSpec<?> authorized() {
+        if (authToken.isEmpty()) {
+            return restClient.post();
+        }
+        return restClient.post().header("Authorization", "Bearer " + authToken);
+    }
+
     private Map<String, Object> post(String path, Map<String, Object> payload) {
-        return restClient.post()
+        return authorized()
             .uri(path)
             .contentType(MediaType.APPLICATION_JSON)
             .body(payload)
