@@ -50,4 +50,19 @@
 
 ## CI 검사
 
-`master` 또는 `develop` 브랜치를 대상으로 한 푸시 및 풀 리퀘스트는 백엔드 Maven 테스트/패키지 검사와 프론트엔드 설치, 테스트, 빌드, 그리고 높은 심각도의 프로덕션 의존성 감사를 실행합니다.
+`master` 또는 `develop` 브랜치를 대상으로 한 푸시 및 풀 리퀘스트는 다음 워크플로우(`.github/workflows/ci.yml`)를 실행합니다.
+
+- **backend**: JDK 21 + Maven wrapper 로 백엔드 테스트(`./mvnw test`) 및 패키징
+- **frontend**: Node.js 20 + npm ci 로 의존성 설치, 테스트(`npm run test:run`), 빌드(`npm run build`)
+
+> 참고: 백엔드 통합 테스트는 `local` 프로파일과 H2 인메모리 DB를 사용하므로 별도의 PostgreSQL 없이도 CI에서 그대로 실행됩니다.
+
+## 테스트 실행 방법 (로컬)
+
+```bash
+# 백엔드 (JDK 21 필요)
+cd backend-java && ./mvnw test
+
+# 프론트엔드 (Node.js 20 필요)
+cd frontend && npm ci && npm run test:run && npm run build
+```

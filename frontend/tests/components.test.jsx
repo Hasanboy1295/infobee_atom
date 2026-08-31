@@ -5,6 +5,7 @@ import AdminPage from '../app/admin/page';
 import HomePage from '../app/page';
 import SignupPage from '../app/signup/page';
 import { AuthProvider } from '../components/AuthProvider';
+import { LanguageProvider } from '../components/LanguageProvider';
 import { ToastProvider } from '../components/Toast';
 import { RequestDetail } from '../components/RequestDetail';
 import { RequestList } from '../components/RequestList';
@@ -60,12 +61,24 @@ const request = {
 };
 
 function renderWithAuth(element, session) {
+  localStorage.setItem('atom-lang', 'en');
   saveSession(session);
   vi.spyOn(authApi, 'me').mockResolvedValue(session.user);
   render(
-    <ToastProvider>
-      <AuthProvider>{element}</AuthProvider>
-    </ToastProvider>
+    <LanguageProvider>
+      <ToastProvider>
+        <AuthProvider>{element}</AuthProvider>
+      </ToastProvider>
+    </LanguageProvider>
+  );
+}
+
+function renderWithProviders(element) {
+  localStorage.setItem('atom-lang', 'en');
+  render(
+    <LanguageProvider>
+      <ToastProvider>{element}</ToastProvider>
+    </LanguageProvider>
   );
 }
 
@@ -84,10 +97,8 @@ describe('login UI', () => {
 
   it('logs in and redirects an administrator to the admin page', async () => {
     vi.spyOn(authApi, 'login').mockResolvedValue({ user: admin });
-    render(
-      <ToastProvider>
-        <AuthProvider><HomePage /></AuthProvider>
-      </ToastProvider>
+    renderWithProviders(
+      <AuthProvider><HomePage /></AuthProvider>
     );
 
     fireEvent.change(screen.getByPlaceholderText('Enter password'), { target: { value: 'password' } });
@@ -99,10 +110,8 @@ describe('login UI', () => {
 
   it('shows an authentication error without redirecting', async () => {
     vi.spyOn(authApi, 'login').mockRejectedValue(new ApiError('Invalid credentials', 401));
-    render(
-      <ToastProvider>
-        <AuthProvider><HomePage /></AuthProvider>
-      </ToastProvider>
+    renderWithProviders(
+      <AuthProvider><HomePage /></AuthProvider>
     );
     routerReplace.mockReset();
     fireEvent.change(screen.getByPlaceholderText('Enter password'), { target: { value: 'password' } });
@@ -130,21 +139,20 @@ describe('signup UI', () => {
 
   it('renders modern signup page and creates a new account', async () => {
     const signupSpy = vi.spyOn(authApi, 'signup').mockResolvedValue({ id: 10, username: 'newuser', fullName: 'New User' });
-    render(
-      <ToastProvider>
-        <SignupPage />
-      </ToastProvider>
+    renderWithProviders(
+      <SignupPage />
     );
 
-    expect(screen.getByText('Create an account')).toBeTruthy();
+    expect(screen.getByText('Create your account')).toBeTruthy();
     expect(screen.getByText('ATOM Kinetics Yield Engine')).toBeTruthy();
 
 fireEvent.change(screen.getByPlaceholderText('e.g. Kim Minsoo'), { target: { value: 'New User' } });
-      fireEvent.change(screen.getByPlaceholderText('e.g. user1234'), { target: { value: 'newuser' } });
-    fireEvent.change(screen.getByPlaceholderText('At least 8 characters'), { target: { value: 'Secret123!' } });
-    fireEvent.change(screen.getByPlaceholderText('Re-enter your password'), { target: { value: 'Secret123!' } });
+fireEvent.change(screen.getByPlaceholderText('e.g. user1234'), { target: { value: 'newuser' } });
+    const passwordInputs = screen.getAllByPlaceholderText('Enter password');
+    fireEvent.change(passwordInputs[0], { target: { value: 'Secret123!' } });
+    fireEvent.change(passwordInputs[1], { target: { value: 'Secret123!' } });
 
-    fireEvent.click(screen.getByRole('button', { name: /Create free account/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Create account/i }));
 
     await waitFor(() => expect(signupSpy).toHaveBeenCalledWith('newuser', 'Secret123!', 'New User'));
   });
@@ -198,7 +206,7 @@ describe('admin authorization and CRUD UI', () => {
       fullName: 'New User',
       role: 'USER',
     }));
-    expect((await screen.findByRole('status')).textContent).toContain('User saved.');
+    expect((await screen.findByRole('status')).textContent).toContain('Success');
   });
 });
 
