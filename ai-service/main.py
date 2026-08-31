@@ -407,8 +407,15 @@ def _resolve_parameters(conditions: dict) -> tuple[dict[str, float], list[str], 
     for key, value in conditions.items():
         canonical = ALIAS_INDEX.get(key.strip().lower())
         if canonical is None:
-            if key.strip().lower() != "solventtype":
-                unknown_keys.add(key)
+            # ML-only keys (SMILES strings) are expected but not part of the
+            # deterministic scoring - consume them silently.
+            ml_key = key.strip().lower().replace("_", "").replace("-", "")
+            if ml_key in (
+                "basesmiles", "ligandsmiles", "solventsmiles",
+                "basesmil", "ligandsmil", "solventsmil", "solventtype",
+            ):
+                continue
+            unknown_keys.add(key)
             continue
         number = _as_number(value)
         if number is None:
