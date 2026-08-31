@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -20,6 +21,27 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+# Optional ML model (trained on ATOM / EDBO direct-arylation data). The model
+# is loaded lazily so the service still boots if scikit-learn or the artifact
+# is missing; in that case ML scoring degrades to an explicit "unavailable"
+# result while the deterministic engine keeps working.
+ML_MODEL_VERSION = "edbo-hgb-1.0.0"
+_model = None
+_model_error: Optional[str] = None
+try:
+    import joblib  # type: ignore
+
+    _MODEL_PATH = os.path.join(os.path.dirname(__file__), "atom_model.joblib")
+    if os.path.exists(_MODEL_PATH):
+        _payload = joblib.load(_MODEL_PATH)
+        _model = _payload["model"]
+        _feature_names = list(_payload["feature_names"])
+        _model_meta = _payload
+    else:
+        _model_error = "ML artifact atom_model.joblib not found; ML scoring unavailable"
+except Exception as exc:  # pragma: no cover - env dependent
+    _model_error = f"ML model failed to load: {exc}"
 
 load_dotenv()
 
@@ -115,9 +137,15 @@ def model_info():
         "status": "success",
         "atomModel": {
             "version": ATOM_MODEL_VERSION,
-            "type": "deterministic reaction-kinetics approximation",
+            "type": "deterministic reaction-kinetics + ML (ATOM/EDBO-trained) yield prediction",
             "endpoint": "/predict/atom",
             "parameters": sorted(PARAM_SPECS.keys()) + ["solventType"],
+            "mlModel": {
+                "available": _model is not None,
+                "version": ML_MODEL_VERSION if _model else None,
+                "trainedOn": "EDBO direct-arylation dataset (ATOM)",
+                "status": None if _model is not None else (_model_error or "not loaded"),
+            },
         },
         "llmModel": {
             "mode": llm_mode(),
@@ -304,6 +332,15 @@ def predict_atom(req: AtomPredictRequest, request: Request):
     if unknown_keys:
         summary_notes += f" Ignored unrecognized keys: {', '.join(sorted(unknown_keys))}."
 
+    ml_result = _ml_predict(conditions)
+    if ml_result is not None and ml_result.get("available") and ml_result.get("predictedYieldPercent") is not None:
+        ml_yield = ml_result["predictedYieldPercent"]
+        summary_notes += (
+            f" ML ({ML_MODEL_VERSION}, trained on EDBO direct-arylation data, "
+            f"R2={ml_result.get('trainR2')}, MAE={ml_result.get('trainMae')}) predicts "
+            f"yield {ml_yield:.2f}%."
+        )
+
     result = {
         "predictionId": req.predictionId,
         "modelVersion": ATOM_MODEL_VERSION,
@@ -313,6 +350,7 @@ def predict_atom(req: AtomPredictRequest, request: Request):
         "recommendation": recommendation,
         "notes": summary_notes,
         "factorBreakdown": factors,
+        "mlPrediction": ml_result,
         "warnings": warnings,
     }
     elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -397,6 +435,107 @@ def _estimate_confidence(resolved: dict, warnings: list[str]) -> float:
         confidence += 0.03
     confidence -= 0.12 * len(warnings)
     return round(min(max(confidence, 0.15), 0.93), 3)
+
+
+# --------------------------------------------------------------------------
+# ML scoring (ATOM / EDBO-trained yield model)
+#
+# Turns optional SMILES + reaction conditions into the feature vector used by
+# the HistGradientBoosting model trained on the EDBO direct-arylation dataset
+# (molecular composition descriptors + temperature + concentration). Returns an
+# explicit "unavailable" result when the model is not loaded.
+# --------------------------------------------------------------------------
+
+_ML_ELEMENTS = ["C", "N", "O", "P", "S", "F", "Cl", "Br", "I", "B", "Si", "K", "Na", "Li"]
+_ML_TOKEN_RE = re.compile(r"Cl|Br|[A-Z][a-z]?|[a-z]")
+_ML_MASS = {"C": 12, "N": 14, "O": 16, "P": 31, "S": 32, "F": 19, "Cl": 35.5,
+            "Br": 80, "I": 127, "B": 11, "Si": 28, "K": 39, "Na": 23, "Li": 7}
+
+
+def _ml_elem_counts(smiles: str) -> dict:
+    counts = {e: 0 for e in _ML_ELEMENTS}
+    if not smiles:
+        return counts
+    for tok in _ML_TOKEN_RE.findall(smiles):
+        if tok in counts:
+            counts[tok] += 1
+    return counts
+
+
+def _ml_approx_mass(counts: dict) -> float:
+    return sum(_ML_MASS.get(e, 0) * n for e, n in counts.items())
+
+
+def _build_ml_features(conditions: dict) -> Optional[list]:
+    """Return the ordered ML feature vector, or None if SMILES are absent."""
+    smiles_present = any(
+        conditions.get(k) for k in ("baseSmiles", "ligandSmiles", "solventSmiles")
+        # also allow camel/pascal aliases used by clients
+    ) or any(
+        conditions.get(k) for k in ("base_smiles", "ligand_smiles", "solvent_smiles",
+                                    "basesmiles", "ligandsmiles", "solventsmiles")
+    ) or any(
+        conditions.get(k) for k in ("base_smil", "ligand_smil", "solvent_smil")
+    )
+    if not smiles_present:
+        return None
+
+    def _smiles(key):
+        for cand in (key, key.replace("Smiles", "_smiles").lower(),
+                     key.lower(), key.replace("Smiles", "SMILES").lower()):
+            if conditions.get(cand):
+                return str(conditions[cand])
+        return ""
+
+    base = _ml_elem_counts(_smiles("baseSmiles"))
+    lig = _ml_elem_counts(_smiles("ligandSmiles"))
+    solv = _ml_elem_counts(_smiles("solventSmiles"))
+
+    temp = _as_number(conditions.get("temperatureC")) or 105.0
+    # concentration delivered in mg/mL; EDBO trained in molarity (~0.1 M range).
+    # Rough scalar conversion: divide by 100 to land in a comparable order of
+    # magnitude for typical substrates (MW ~100-200 g/mol).
+    conc_ml = _as_number(conditions.get("concentrationMgMl"))
+    conc = (conc_ml / 100.0) if conc_ml is not None else 0.1
+
+    feats = {
+        "temp": temp,
+        "conc": round(conc, 4),
+        "base_mass": _ml_approx_mass(base), "base_C": base["C"],
+        "base_N": base["N"], "base_O": base["O"], "base_P": base["P"],
+        "base_S": base["S"], "base_hal": base["F"] + base["Cl"] + base["Br"] + base["I"],
+        "lig_mass": _ml_approx_mass(lig), "lig_C": lig["C"],
+        "lig_N": lig["N"], "lig_O": lig["O"], "lig_P": lig["P"],
+        "lig_S": lig["S"], "lig_hal": lig["F"] + lig["Cl"] + lig["Br"] + lig["I"],
+        "solv_mass": _ml_approx_mass(solv), "solv_C": solv["C"],
+        "solv_N": solv["N"], "solv_O": solv["O"], "solv_hal": solv["F"] + solv["Cl"] + solv["Br"] + solv["I"],
+    }
+    return [feats[k] for k in _feature_names]
+
+
+def _ml_predict(conditions: dict) -> Optional[dict]:
+    """Run the trained model. Returns the ML result block or None."""
+    if _model is None:
+        return {"available": False, "reason": _model_error or "ML model not loaded",
+                "predictedYieldPercent": None}
+    vector = _build_ml_features(conditions)
+    if vector is None:
+        return None
+    try:
+        pred = float(_model.predict([vector])[0])
+        pred = round(min(max(pred, 0.0), 100.0), 2)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"available": False, "reason": f"ML inference failed: {exc}",
+                "predictedYieldPercent": None}
+    return {
+        "available": True,
+        "modelVersion": ML_MODEL_VERSION,
+        "predictedYieldPercent": pred,
+        "trainR2": round(_model_meta.get("train_r2", 0.0), 4) if _model else None,
+        "trainMae": round(_model_meta.get("train_mae", 0.0), 4) if _model else None,
+        "nSamples": _model_meta.get("n_samples") if _model else None,
+        "featureNames": list(_feature_names) if _model else None,
+    }
 
 
 # --------------------------------------------------------------------------
